@@ -23,13 +23,17 @@ def test_authenticated_workbench_matches_api(media, tmp_path):
     base, query = url.split("?")
     token = query.split("=")[1]
 
-    def call(method, data):
+    def request(method, data):
         request = Request(
             base + "api/" + method,
             data=json.dumps(data).encode(),
             headers={"Content-Type": "application/json", "X-Session-Token": token},
         )
-        return json.load(urlopen(request, timeout=10))
+        return urlopen(request, timeout=10)
+
+    def call(method, data):
+        with request(method, data) as response:
+            return json.load(response)
 
     try:
         with pytest.raises(HTTPError) as denied:
@@ -44,6 +48,11 @@ def test_authenticated_workbench_matches_api(media, tmp_path):
         )
         with Engine(video) as engine:
             np.testing.assert_array_equal(pixels, engine.render(project, 5))
+        with request("playback", {"project": project.to_dict(), "frame": 5}) as response:
+            assert response.headers.get_content_type() == "image/jpeg"
+            with Image.open(BytesIO(response.read())) as preview:
+                assert preview.size == (96, 64)
+                assert preview.getpixel((38, 32))[0] > 220
         job = call(
             "export_start",
             {"project": project.to_dict(), "path": str(tmp_path / "output.mp4")},
@@ -73,7 +82,7 @@ def test_import_progress_is_pollable_and_failed_import_can_retry(media, monkeypa
     entered, release = threading.Event(), threading.Event()
     real_engine = server.Engine
 
-    def gated_engine(video, progress=None):
+    def gated_engine(video, progress=None, **kwargs):
         def callback(phase, index):
             if progress:
                 progress(phase, index)
@@ -81,7 +90,7 @@ def test_import_progress_is_pollable_and_failed_import_can_retry(media, monkeypa
                 entered.set()
                 assert release.wait(5)
 
-        return real_engine(video, progress=callback)
+        return real_engine(video, progress=callback, **kwargs)
 
     monkeypatch.setattr(server, "Engine", gated_engine)
     workbench = server.Workbench()

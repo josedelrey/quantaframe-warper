@@ -2,8 +2,8 @@
 const $ = id => document.getElementById(id)
 const token = new URLSearchParams(location.search).get('token')
 let project = {version:1,video:'',assets:{},placements:[]}
-let info, selected = -1, current = 0, playing = false, busy = false
-let revision = 0, pending = false, rendering = false, drag = null, dirty = false
+let info, selected = -1, current = 0, playback = null, busy = false
+let revision = 0, pending = null, rendering = false, drag = null, dirty = false
 const controls = ['start','duration','x','y','scale','rotation','strength']
 const canvas = $('preview'), context = canvas.getContext('2d'), transform = $('transform')
 const assetSizes = {}
@@ -15,8 +15,9 @@ function status(text) {
 }
 function notice(text) { $('empty').textContent = text; $('empty').hidden = false }
 function failure(error) { console.error(error.stack || error.message); status(error.message); notice(`Could not load or process video: ${error.message}`) }
-async function api(method, data) {
+async function api(method, data, binary = false) {
   const response = await fetch(`/api/${method}`, {method:'POST',headers:{'Content-Type':'application/json','X-Session-Token':token},body:JSON.stringify(data)})
+  if (response.ok && binary) return response.blob()
   const result = await response.json()
   if (!response.ok) throw Error(result.error || 'Request failed')
   return result
@@ -34,14 +35,17 @@ async function action(work) {
   try { await work() } catch (error) { failure(error) }
   finally { busy = false; sync(); document.querySelectorAll('header button').forEach(b => { b.disabled = false }) }
 }
-function stop() { playing = false; $('play').textContent = 'Play' }
-function sync() {
+function stop() { playback = null; $('play').textContent = 'Play' }
+function syncTimeline() {
   $('timeline').value = current
   $('frame').value = current
+  updateTransform()
+}
+function sync() {
+  syncTimeline()
   $('time').textContent = `/ ${info ? info.frames - 1 : 0}`
   const p = project.placements[selected]
   for (const key of controls) { $(key).disabled = !p || busy; $(key).value = p ? p[key] : '' }
-  updateTransform()
   $('layers').replaceChildren()
   project.placements.forEach((p,index) => {
     const button = document.createElement('button')
@@ -63,7 +67,7 @@ async function library() {
   }
 }
 async function prepare() {
-  revision++; pending = false
+  revision++; pending = null
   notice('Opening video…')
   status('Opening video…')
   // Validate thumbnails before replacing the current engine or timeline state.
@@ -81,28 +85,47 @@ async function prepare() {
   }
   info = nextInfo
   canvas.width = info.width; canvas.height = info.height
+  canvas.style.aspectRatio = `${info.width} / ${info.height}`
   $('timeline').max = $('frame').max = info.frames - 1
   current = 0; selected = -1
   sync(); notice('Rendering first frame…'); requestRender()
   status(`${info.width} × ${info.height} · ${info.frames} frames · ${info.fps.toFixed(3)} fps · ${info.vectors} codec vectors`)
 }
-function requestRender() {
+function requestRender(frame = current, session = null) {
   if (!info) return
-  revision++; pending = true
+  revision++; pending = {frame, session}
   if (!rendering) void renderLoop()
+}
+async function loadFrame(frame, session) {
+  if (session) return createImageBitmap(await api('playback', {project, frame}, true))
+  const result = await api('render', {project, frame})
+  const image = new Image()
+  image.src = result.url
+  await image.decode()
+  return image
 }
 async function renderLoop() {
   rendering = true
   while (pending) {
-    pending = false
+    const {frame, session} = pending
+    pending = null
     const ticket = revision
     try {
-      const result = await api('render',{project,frame:current})
-      const image = new Image()
-      image.src = result.url
-      await image.decode()
-      if (ticket === revision) { context.drawImage(image,0,0); $('empty').hidden = true }
-    } catch (error) { failure(error); stop() }
+      const image = await loadFrame(frame, session)
+      if (ticket === revision && (!session || session === playback)) {
+        if (canvas.width !== image.width || canvas.height !== image.height) {
+          canvas.width = image.width; canvas.height = image.height
+        }
+        context.drawImage(image,0,0)
+        $('empty').hidden = true
+        current = frame
+        if (session && current === info.frames - 1) stop()
+        syncTimeline()
+      }
+      image.close?.()
+    } catch (error) {
+      if (ticket === revision && (!session || session === playback)) { failure(error); stop() }
+    }
   }
   rendering = false
 }
@@ -114,16 +137,34 @@ $('timeline').oninput = event => seek(event.target.value)
 $('frame').onchange = event => seek(event.target.value)
 $('back').onclick = () => seek(current - 1)
 $('next').onclick = () => seek(current + 1)
-$('play').onclick = async () => {
-  if (!info || busy) return
-  if (playing) { stop(); return }
-  playing = true; $('play').textContent = 'Pause'
-  while (playing && current < info.frames - 1) {
-    const start = performance.now()
-    if (!rendering) { current++; sync(); requestRender() }
-    await new Promise(resolve => setTimeout(resolve, Math.max(15, 1000 * (info.timestamps && current > 0 ? info.timestamps[current] - info.timestamps[current-1] : 1 / info.fps) - (performance.now() - start))))
+function tickPlayback(session, now) {
+  if (session !== playback) return
+  if (!rendering) {
+    const time = info.timestamps[session.frame] + (now - session.started) / 1000
+    let left = current, right = info.frames - 1
+    while (left < right) {
+      const mid = Math.ceil((left + right) / 2)
+      if (info.timestamps[mid] <= time) left = mid
+      else right = mid - 1
+    }
+    if (left > current) requestRender(left, session)
   }
-  stop()
+  requestAnimationFrame(now => tickPlayback(session, now))
+}
+$('play').onclick = () => {
+  if (!info || busy) return
+  if (playback) {
+    stop()
+    syncTimeline()
+    return
+  }
+  if (info.frames < 2) return
+  const restart = current === info.frames - 1
+  const session = {frame:restart ? 0 : current, started:performance.now()}
+  playback = session
+  $('play').textContent = 'Pause'
+  if (restart) requestRender(0, session)
+  requestAnimationFrame(now => tickPlayback(session, now))
 }
 $('video').onclick = () => action(async () => {
   const [path] = await choose('video'); if (!path) return
@@ -161,6 +202,7 @@ $('export').onclick = () => action(async () => {
 })
 $('remove').onclick = () => {
   if (busy || selected < 0) return
+  stop()
   project.placements.splice(selected,1); selected = -1; dirty = true; sync(); requestRender()
 }
 for (const key of controls) $(key).onchange = () => {
@@ -172,12 +214,20 @@ for (const key of controls) $(key).onchange = () => {
       (key === 'strength' && Math.abs(value) > 20)) { sync(); return }
   p[key] = value; current = p.start; dirty = true; stop(); sync(); requestRender()
 }
-function point(event) {
+function frameGeometry() {
   const rect = canvas.getBoundingClientRect()
   // object-fit:contain can letterbox within the CSS canvas box.
   const scale = Math.min(rect.width / canvas.width, rect.height / canvas.height)
-  return {x:(event.clientX - rect.left - (rect.width - canvas.width * scale) / 2) / scale,
-          y:(event.clientY - rect.top - (rect.height - canvas.height * scale) / 2) / scale}
+  return {
+    left:rect.left + (rect.width - canvas.width * scale) / 2,
+    top:rect.top + (rect.height - canvas.height * scale) / 2,
+    xScale:canvas.width * scale / info.width,
+    yScale:canvas.height * scale / info.height
+  }
+}
+function point(event) {
+  const {left,top,xScale,yScale} = frameGeometry()
+  return {x:(event.clientX - left) / xScale, y:(event.clientY - top) / yScale}
 }
 canvas.ondragover = event => { if (info && !busy) event.preventDefault() }
 canvas.ondrop = event => {
@@ -189,15 +239,14 @@ canvas.ondrop = event => {
 }
 function updateTransform() {
   const p = project.placements[selected], size = p && assetSizes[p.asset]
-  transform.hidden = !info || !p || !size || current !== p.start || busy
+  transform.hidden = !info || !p || !size || current !== p.start || busy || !!playback
   if (transform.hidden) return
-  const rect = canvas.getBoundingClientRect(), stage = $('stage').getBoundingClientRect()
-  const factor = Math.min(rect.width / canvas.width, rect.height / canvas.height)
-  const left = rect.left - stage.left + (rect.width - canvas.width * factor) / 2
-  const top = rect.top - stage.top + (rect.height - canvas.height * factor) / 2
-  const width = size.width * p.scale * factor, height = size.height * p.scale * factor
+  const stage = $('stage').getBoundingClientRect()
+  const {left,top,xScale,yScale} = frameGeometry()
+  const width = size.width * p.scale * xScale, height = size.height * p.scale * yScale
   Object.assign(transform.style,{width:`${width}px`,height:`${height}px`,
-    left:`${left + p.x * factor - width / 2}px`,top:`${top + p.y * factor - height / 2}px`,
+    left:`${left - stage.left + p.x * xScale - width / 2}px`,
+    top:`${top - stage.top + p.y * yScale - height / 2}px`,
     transform:`rotate(${p.rotation}deg)`})
 }
 window.addEventListener('resize', updateTransform)

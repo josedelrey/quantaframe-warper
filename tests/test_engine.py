@@ -1,11 +1,12 @@
 from dataclasses import replace
+from io import BytesIO
 
 import av
 import numpy as np
 import pytest
 from PIL import Image
 
-from quantaframe_warper import Engine, Placement, Project
+from quantaframe_warper import Engine, Placement, Project, engine
 
 
 def test_real_b_frame_input_vectors_replay_and_export(media, tmp_path):
@@ -59,6 +60,42 @@ def test_real_b_frame_input_vectors_replay_and_export(media, tmp_path):
         with pytest.raises(ValueError, match="outside"):
             engine.render(project, 12)
     assert not root.exists()
+
+
+def test_import_discards_session_when_frame_cache_write_fails(media, monkeypatch):
+    video, _ = media
+    cache_roots = set()
+
+    def fail_save(_image, path, **kwargs):
+        cache_roots.add(path.parent)
+        raise OSError("Disk full")
+
+    monkeypatch.setattr(Image.Image, "save", fail_save)
+    with pytest.raises(OSError, match="Disk full"):
+        Engine(video)
+    assert cache_roots and all(not path.exists() for path in cache_roots)
+
+
+def test_scaled_playback_replays_skipped_frames_independently(media, monkeypatch):
+    video, asset = media
+    monkeypatch.setattr(engine, "_PLAYBACK_MAX_EDGE", 48)
+    project = Project(
+        str(video), {"red": str(asset)}, (Placement("red", x=32, y=32, duration=8),)
+    )
+    with Engine(video, playback=True) as session:
+        exact = session.render(project, 5)
+        first = session.playback_frame(project, 0)
+        skipped = session.playback_frame(project, 5)
+        assert session.playback_frame(project, 0) == first
+        for index in range(1, 5):
+            session.playback_frame(project, index)
+        assert session.playback_frame(project, 5) == skipped
+        with Image.open(BytesIO(skipped)) as preview:
+            assert preview.size == (48, 32)
+            r, g, b = preview.getpixel((21, 16))
+            assert r > 225 and g < 30 and b < 30
+        assert session.playback_frame(project, 8) == (session.root / "8.jpg").read_bytes()
+        np.testing.assert_array_equal(session.render(project, 5), exact)
 
 
 def test_settings_validation():

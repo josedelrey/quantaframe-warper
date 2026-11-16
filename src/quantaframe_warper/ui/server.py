@@ -121,7 +121,7 @@ class Workbench:
     def ensure_engine(self, project, progress=None):
         if self.engine is None or self.engine.video != Path(project.video).resolve():
             LOG.info("Opening video: %s", project.video)
-            engine = Engine(project.video, progress=progress)
+            engine = Engine(project.video, progress=progress, playback=True)
             if self.engine:
                 self.engine.close()
             self.engine = engine
@@ -157,11 +157,13 @@ class Workbench:
             if method == "render":
                 image = Image.fromarray(self.engine.render(project, data["frame"]))
                 buffer = BytesIO()
-                image.save(buffer, format="PNG")
+                image.save(buffer, format="PNG", compress_level=1)
                 return {
                     "url": "data:image/png;base64,"
                     + base64.b64encode(buffer.getvalue()).decode()
                 }
+            if method == "playback":
+                return self.engine.playback_frame(project, data["frame"])
             raise ValueError("Unknown method")
 
     def close(self):
@@ -233,10 +235,12 @@ def create_server():
                 if not 0 < length <= 2_000_000:
                     raise ValueError("Invalid request length")
                 data = json.loads(self.rfile.read(length))
-                result = workbench.call(
-                    urlsplit(self.path).path.removeprefix("/api/"), data
-                )
-                self.reply(200, json.dumps(result).encode())
+                method = urlsplit(self.path).path.removeprefix("/api/")
+                result = workbench.call(method, data)
+                if method == "playback":
+                    self.reply(200, result, "image/jpeg")
+                else:
+                    self.reply(200, json.dumps(result).encode())
             except Exception as error:
                 LOG.exception("%s %s failed", self.command, urlsplit(self.path).path)
                 self.reply(400, json.dumps({"error": str(error)}).encode())

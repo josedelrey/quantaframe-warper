@@ -3,16 +3,46 @@
 from __future__ import annotations
 
 import tempfile
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from fractions import Fraction
-from itertools import chain
+from io import BytesIO
+from itertools import chain, islice
 from pathlib import Path
 
 import av
+import cv2
 import numpy as np
 from PIL import Image
 
 from .configuration import Project
 from .motion import composite, place, vector_field, warp
+
+_CACHE_WORKERS = 3
+_PLAYBACK_MAX_EDGE = 960
+_PLAYBACK_JPEG_QUALITY = 88
+_ROTATION_CODES = {
+    90: cv2.ROTATE_90_COUNTERCLOCKWISE,
+    180: cv2.ROTATE_180,
+    270: cv2.ROTATE_90_CLOCKWISE,
+}
+
+
+def _cache_background(path, rgb, playback_size):
+    Image.fromarray(rgb).save(path, compress_level=1)
+    if playback_size is not None:
+        preview = cv2.resize(rgb, playback_size, interpolation=cv2.INTER_AREA)
+        Image.fromarray(preview).save(
+            path.with_suffix(".jpg"), quality=_PLAYBACK_JPEG_QUALITY
+        )
+
+
+@dataclass
+class _Replay:
+    project: dict | None = None
+    frame: int = -1
+    layers: dict = field(default_factory=dict)
 
 
 class Engine:
@@ -22,23 +52,33 @@ class Engine:
     Sessions are synchronous and must not be accessed concurrently.
     """
 
-    def __init__(self, video, *, progress=None):
+    def __init__(self, video, *, progress=None, playback=False, frame_limit=None):
+        if frame_limit is not None and (
+            type(frame_limit) is not int or frame_limit < 1
+        ):
+            raise ValueError("Frame limit must be a positive integer")
         self.video = Path(video).resolve()
         self._temp = tempfile.TemporaryDirectory(prefix="quantaframe-")
         self.root = Path(self._temp.name)
-        self._last_project = None
-        self._last_frame = -1
-        self._layers = {}
+        self._replay = _Replay()
+        self._playback_replay = _Replay()
+        self._playback_size = None
         try:
-            self._prepare(progress or (lambda phase, index: None))
+            self._prepare(
+                progress or (lambda phase, index: None), playback, frame_limit
+            )
         except BaseException:
             self.close()
             raise
 
-    def _prepare(self, progress):
+    def _prepare(self, progress, playback, frame_limit):
         proxy = self.root / "analysis.mp4"
         self.count = 0
-        with av.open(str(self.video)) as source, av.open(str(proxy), "w") as output:
+        with (
+            av.open(str(self.video)) as source,
+            av.open(str(proxy), "w") as output,
+            ThreadPoolExecutor(max_workers=_CACHE_WORKERS) as cache,
+        ):
             if not source.streams.video:
                 raise ValueError("Input contains no video stream")
             stream = source.streams.video[0]
@@ -53,17 +93,27 @@ class Engine:
             rotation = first.rotation
             if rotation % 90:
                 raise ValueError("Only right-angle video rotation is supported")
+            rotation_code = _ROTATION_CODES.get(rotation % 360)
             self.width, self.height = source_size
             if rotation % 180:
                 self.width, self.height = self.height, self.width
             self.time_base = stream.time_base or Fraction(1, 90000)
             self.timestamps = []
             self.frame_durations = []
-            progress("source_frames", stream.frames or 0)
+            source_count = stream.frames or 0
+            if source_count and frame_limit is not None:
+                source_count = min(source_count, frame_limit)
+            progress("source_frames", source_count)
             if self.width % 2 or self.height % 2:
                 raise ValueError("MVP requires even video width and height")
             if stream.sample_aspect_ratio not in (None, Fraction(1)):
                 raise ValueError("MVP requires square pixels")
+            if playback:
+                scale = min(1, _PLAYBACK_MAX_EDGE / max(self.width, self.height))
+                self._playback_size = (
+                    max(1, round(self.width * scale)),
+                    max(1, round(self.height * scale)),
+                )
             encoder = output.add_stream("libx264", rate=self.fps)
             encoder.width, encoder.height = self.width, self.height
             encoder.pix_fmt = "yuv420p"
@@ -73,7 +123,8 @@ class Engine:
                 "x264-params": "bframes=0:ref=1:scenecut=0:keyint=1000000:weightp=0",
             }
             first_time = None
-            for index, frame in enumerate(chain((first,), frames)):
+            pending_cache = deque()
+            for index, frame in enumerate(islice(chain((first,), frames), frame_limit)):
                 if (
                     frame.width,
                     frame.height,
@@ -103,20 +154,32 @@ class Engine:
                     else 1 / self.fps
                 )
                 rgb = frame.to_ndarray(format="rgb24")
-                if rotation:
-                    rgb = np.ascontiguousarray(np.rot90(rgb, rotation // 90))
-                Image.fromarray(rgb).save(self.root / f"{index}.png", compress_level=1)
+                if rotation_code is not None:
+                    rgb = cv2.rotate(rgb, rotation_code)
+                pending_cache.append(
+                    cache.submit(
+                        _cache_background,
+                        self.root / f"{index}.png",
+                        rgb,
+                        self._playback_size,
+                    )
+                )
                 analysis = av.VideoFrame.from_ndarray(rgb, format="rgb24")
                 analysis.pts = index
                 analysis.time_base = 1 / self.fps
                 for packet in encoder.encode(analysis):
                     output.mux(packet)
+                # Bound the number of full-resolution RGB frames held by the cache.
+                if len(pending_cache) == _CACHE_WORKERS:
+                    pending_cache.popleft().result()
+                    self.count += 1
+                    progress("decode", self.count)
+            for saved in pending_cache:
+                saved.result()
                 self.count += 1
                 progress("decode", self.count)
             for packet in encoder.encode():
                 output.mux(packet)
-        if not self.count:
-            raise ValueError("Video has no decoded frames")
         for index in range(self.count - 1):
             self.frame_durations[index] = (
                 self.timestamps[index + 1] - self.timestamps[index]
@@ -158,44 +221,75 @@ class Engine:
 
     def render(self, project: Project, frame: int):
         """Return RGB uint8 pixels. Frame indexes are zero based and in display order."""
+        layers = self._advance_layers(
+            project, frame, self._replay, (self.width, self.height)
+        )
+        with Image.open(self.root / f"{frame}.png") as image:
+            if not layers:
+                return np.array(image)
+            background = np.asarray(image)
+        return composite(background, layers)
+
+    def playback_frame(self, project: Project, frame: int) -> bytes:
+        """Return a bounded JPEG using a separate, scaled replay for playback."""
+        if self._playback_size is None:
+            raise ValueError("Engine was opened without a playback cache")
+        layers = self._advance_layers(
+            project, frame, self._playback_replay, self._playback_size
+        )
+        path = self.root / f"{frame}.jpg"
+        if not layers:
+            return path.read_bytes()
+        with Image.open(path) as image:
+            pixels = composite(np.asarray(image), layers)
+        buffer = BytesIO()
+        Image.fromarray(pixels).save(buffer, format="JPEG", quality=_PLAYBACK_JPEG_QUALITY)
+        return buffer.getvalue()
+
+    def _motion_field(self, index, size):
+        width, height = size
+        scale = (width / self.width, height / self.height)
+        vectors = np.load(self.root / f"{index}.npy", allow_pickle=False)
+        return vector_field(vectors, width, height, scale)
+
+    def _advance_layers(self, project, frame, replay, size):
         if Path(project.video).resolve() != self.video:
             raise ValueError("Project video differs from this engine session")
         if type(frame) is not int or not 0 <= frame < self.count:
             raise ValueError("Frame outside video")
         if any(p.start >= self.count for p in project.placements):
             raise ValueError("Placement starts outside video")
+        if not project.placements:
+            return []
         signature = project.to_dict()
-        if signature != self._last_project or frame < self._last_frame:
+        if signature != replay.project or frame < replay.frame:
             for p in project.placements:
                 if p.start <= frame:
                     with Image.open(project.assets[p.asset]) as asset:
                         if asset.format != "PNG":
                             raise ValueError("Assets must be PNG images")
-            self._layers = {}
-            self._last_frame = (
-                min((p.start for p in project.placements), default=frame) - 1
-            )
-            self._last_project = signature
-        for index in range(self._last_frame + 1, frame + 1):
+            replay.layers.clear()
+            replay.frame = min(p.start for p in project.placements) - 1
+        # A replay that fails mid-frame must be rebuilt on the next request.
+        replay.project = None
+        width, height = size
+        pixel_scale = (width / self.width, height / self.height)
+        for index in range(replay.frame + 1, frame + 1):
             field = None
             for key, p in enumerate(project.placements):
                 if index == p.start:
-                    self._layers[key] = place(
-                        project.assets[p.asset], p, self.width, self.height
+                    replay.layers[key] = place(
+                        project.assets[p.asset], p, width, height, pixel_scale
                     )
                 elif p.start < index < p.start + p.duration:
                     if field is None:
-                        vectors = np.load(
-                            self.root / f"{index}.npy", allow_pickle=False
-                        )
-                        field = vector_field(vectors, self.width, self.height)
-                    self._layers[key] = warp(self._layers[key], field, p.strength)
+                        field = self._motion_field(index, size)
+                    replay.layers[key] = warp(replay.layers[key], field, p.strength)
                 elif index >= p.start + p.duration:
-                    self._layers.pop(key, None)
-        self._last_frame = frame
-        with Image.open(self.root / f"{frame}.png") as image:
-            background = np.asarray(image)
-        return composite(background, [self._layers[k] for k in sorted(self._layers)])
+                    replay.layers.pop(key, None)
+        replay.frame = frame
+        replay.project = signature
+        return [replay.layers[k] for k in sorted(replay.layers)]
 
     def export(self, project, output, *, progress=None):
         """Export silent H.264 MP4 atomically. The source is never overwritten."""

@@ -48,6 +48,16 @@ def test_missing_blocks_hold_and_future_references_rejected():
         vector_field(np.array([(1, 4, 4, 2, 2, 0, 0, 4)], dtype=DTYPE), 4, 4)
 
 
+def test_preview_scales_block_bounds_and_preserves_overwrite_order():
+    first = (-1, 4, 4, 2, 2, -4, 0, 4)
+    second = (-1, 4, 4, 4, 2, 4, 0, 4)
+    scale = (0.5, 0.5)
+    single = vector_field(np.array([first], dtype=DTYPE), 4, 2, scale)
+    np.testing.assert_array_equal(single[..., 0], [[-0.5, -0.5, 0, 0]] * 2)
+    overlap = vector_field(np.array([first, second], dtype=DTYPE), 4, 2, scale)
+    np.testing.assert_array_equal(overlap[..., 0], [[-0.5, 0.5, 0.5, 0]] * 2)
+
+
 def test_premultiplication_prevents_transparent_color_bleed(tmp_path):
     asset = np.zeros((4, 4, 4), np.uint8)
     asset[:] = [0, 255, 0, 0]

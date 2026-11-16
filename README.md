@@ -155,14 +155,17 @@ softens detail. These artifacts are part of the experiment.
 Following Luma Fattal's basic structure, `src/quantaframe_warper/` contains the
 configuration, engine, CLI and UI server. `desktop/` hosts a small Electron shell.
 By default, a sandboxed renderer calls an authenticated loopback Python HTTP server, and a
-narrow preload bridge opens native file dialogs. The canvas only displays PNGs
-rendered by Python. Preview and export call the identical `Engine.render()` path.
+narrow preload bridge opens native file dialogs. The canvas displays frames rendered
+by Python. Seeking, editing and export use the full-resolution `Engine.render()` path.
 
 - Start with short, modest-resolution clips. Decoded RGB PNGs and sparse vector
   arrays live in a temporary directory until the session closes. Long clips can
   consume substantial disk space. Preparation is repeated when reopening the app.
-- Forward playback advances frame by frame at the engine's achievable speed.
-  It can be slower than real time. Backward seeks and edits replay propagation
+- Playback uses temporary JPEG backgrounds and propagates layers on a preview
+  grid capped at 960 pixels on the longest edge. It follows the source timestamps
+  and can skip drawing frames when rendering falls behind. Layer propagation
+  still runs through each intermediate frame. Pausing keeps the last displayed
+  preview until you seek or edit. Backward seeks and edits replay propagation
   from the earliest placement. There are no persistent checkpoints yet.
 - The MVP accepts even-sized, square-pixel video with increasing presentation
   timestamps. Constant and variable frame rates and right-angle display rotation
@@ -195,9 +198,9 @@ Tests cover codec vector sign and fractional precision, independent deformation
 of opposing regions, premultiplied alpha, input B-frame handling, deterministic
 seeks, layer expiration, settings validation, preview/export agreement, session cleanup,
 authenticated UI transport, rotated VFR import and export timing, and pollable
-import progress with failure recovery. The Electron smoke exercises visible import
-errors and retry, the editor controls and export using generated
-inputs, writing a screenshot and output
+import progress with failure recovery. The Electron smoke uses generated inputs to
+exercise visible import errors and retry, playback with a delayed frame, the editor
+controls and export. It writes a screenshot and output
 under `outputs/demo/`. The headless test and the explicit `start:unsandboxed`
 development fallback disable Chromium's process sandbox. Normal desktop startup
 uses Electron's renderer sandbox.

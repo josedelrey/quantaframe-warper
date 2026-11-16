@@ -28,6 +28,21 @@ app.on('browser-window-created', (_, window) => {
         if (document.querySelector('#empty').hidden || info) throw Error('Import failure was hidden')
         click('video'); await wait(() => !busy && !!info && !rendering)
         if (info.frames !== 72) throw Error('Wrong frame count')
+        const realFetch = window.fetch
+        const played = []
+        window.fetch = async (url, options) => {
+          if (url === '/api/playback') {
+            played.push(JSON.parse(options.body).frame)
+            if (played.length === 1) await new Promise(resolve => setTimeout(resolve, 240))
+          }
+          return realFetch(url, options)
+        }
+        click('play'); await wait(() => !playback && !rendering)
+        window.fetch = realFetch
+        if (current !== info.frames - 1 || played.length < 2 || played[1] <= played[0] + 1) {
+          throw Error('Playback did not catch up after a slow frame')
+        }
+        seek(0); await wait(() => !rendering)
         click('assets'); await wait(() => !busy && Object.keys(project.assets).length === 1)
         const rect = canvas.getBoundingClientRect()
         const transfer = new DataTransfer(); transfer.setData('text/plain','eye.png')
