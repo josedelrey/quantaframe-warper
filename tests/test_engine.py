@@ -61,17 +61,7 @@ def test_real_b_frame_input_vectors_replay_and_export(media, tmp_path):
     assert not root.exists()
 
 
-def test_config_roundtrip_and_relative_paths(media, tmp_path):
-    video, asset = media
-    project = Project(str(video), {"red": str(asset)}, (Placement("red", x=20, y=30),))
-    path = tmp_path / "project.yaml"
-    project.save(path)
-    assert Project.load(path) == project
-    path.write_text("video: input.mp4\nassets:\n  red: red.png\nplacements: []\n")
-    assert Project.load(path).video == str(video)
-    path.write_text("video: a\nvideo: b\n")
-    with pytest.raises(ValueError, match="duplicate"):
-        Project.load(path)
+def test_settings_validation():
     with pytest.raises(ValueError):
         Project.from_dict({"video": "a", "unknown": 2})
     with pytest.raises(ValueError):
@@ -134,7 +124,51 @@ def test_layer_order_start_duration_and_safe_save(media, tmp_path):
         assert engine.render(project, 0)[32, 32].tolist() == [255, 0, 0]
         assert engine.render(project, 2)[32, 32].tolist() == [0, 0, 255]
         assert engine.render(project, 4)[32, 32].tolist() == [255, 0, 0]
-    before = video.read_bytes()
-    with pytest.raises(ValueError, match="overwrite"):
-        project.save(video)
-    assert video.read_bytes() == before
+
+
+
+def test_rotated_variable_rate_phone_video_preserves_pixels_and_timing(tmp_path):
+    from fractions import Fraction
+
+    video = tmp_path / "phone.mov"
+    pts = [100, 120, 145, 165, 200]
+    rng = np.random.default_rng(16)
+    texture = rng.integers(0, 256, (64, 96, 3), dtype=np.uint8)
+    with av.open(str(video), "w") as output:
+        stream = output.add_stream("libx264", rate=30)
+        stream.width, stream.height = 96, 64
+        stream.pix_fmt = "yuv420p"
+        stream.time_base = stream.codec_context.time_base = Fraction(1, 600)
+        stream.set_display_rotation(-90)
+        for index, timestamp in enumerate(pts):
+            frame = av.VideoFrame.from_ndarray(
+                np.roll(texture, index * 2, axis=1), format="rgb24"
+            )
+            frame.pts, frame.time_base = timestamp, Fraction(1, 600)
+            for packet in stream.encode(frame):
+                output.mux(packet)
+        for packet in stream.encode():
+            output.mux(packet)
+    with av.open(str(video)) as source:
+        frames = list(source.decode(video=0))
+    assert frames[0].rotation == -90
+    project = Project(str(video))
+    with Engine(video) as engine:
+        assert (engine.width, engine.height, engine.count) == (64, 96, 5)
+        for index, frame in enumerate(frames):
+            np.testing.assert_array_equal(
+                engine.render(project, index),
+                np.rot90(frame.to_ndarray(format="rgb24"), -1),
+            )
+        expected = [(p - pts[0]) / 600 for p in pts]
+        assert engine.info["timestamps"] == pytest.approx(expected)
+        path = tmp_path / "export.mp4"
+        engine.export(project, path)
+        with av.open(str(path)) as output:
+            exported = list(output.decode(video=0))
+        assert [f.time for f in exported] == pytest.approx(expected, abs=1e-5)
+        assert (exported[0].width, exported[0].height, exported[0].rotation) == (
+            64,
+            96,
+            0,
+        )

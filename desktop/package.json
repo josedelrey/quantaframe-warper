@@ -4,6 +4,10 @@
   "private": true,
   "license": "MIT",
   "main": "main.cjs",
-  "scripts": {"start": "electron ."},
+  "scripts": {
+    "start": "electron .",
+    "start:unsandboxed": "electron --no-sandbox .",
+    "test": "node --test ../tests/desktop-logging.test.cjs"
+  },
   "devDependencies": {"electron": "45.2.3"}
 }

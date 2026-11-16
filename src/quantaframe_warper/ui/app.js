@@ -5,8 +5,16 @@ let project = {version:1,video:'',assets:{},placements:[]}
 let info, selected = -1, current = 0, playing = false, busy = false
 let revision = 0, pending = false, rendering = false, drag = null, dirty = false
 const controls = ['start','duration','x','y','scale','rotation','strength']
-const canvas = $('preview'), context = canvas.getContext('2d')
-function status(text) { $('status').textContent = text }
+const canvas = $('preview'), context = canvas.getContext('2d'), transform = $('transform')
+const assetSizes = {}
+window.addEventListener('error', event => console.error('Uncaught UI error:', event.error?.stack || event.message))
+window.addEventListener('unhandledrejection', event => console.error('Unhandled UI rejection:', event.reason?.stack || String(event.reason)))
+function status(text) {
+  if ($('status').textContent !== text) console.info(text)
+  $('status').textContent = text
+}
+function notice(text) { $('empty').textContent = text; $('empty').hidden = false }
+function failure(error) { console.error(error.stack || error.message); status(error.message); notice(`Could not load or process video: ${error.message}`) }
 async function api(method, data) {
   const response = await fetch(`/api/${method}`, {method:'POST',headers:{'Content-Type':'application/json','X-Session-Token':token},body:JSON.stringify(data)})
   const result = await response.json()
@@ -23,8 +31,8 @@ async function action(work) {
   busy = true
   stop()
   document.querySelectorAll('header button').forEach(b => { b.disabled = true })
-  try { await work() } catch (error) { status(error.message) }
-  finally { busy = false; document.querySelectorAll('header button').forEach(b => { b.disabled = false }) }
+  try { await work() } catch (error) { failure(error) }
+  finally { busy = false; sync(); document.querySelectorAll('header button').forEach(b => { b.disabled = false }) }
 }
 function stop() { playing = false; $('play').textContent = 'Play' }
 function sync() {
@@ -33,6 +41,7 @@ function sync() {
   $('time').textContent = `/ ${info ? info.frames - 1 : 0}`
   const p = project.placements[selected]
   for (const key of controls) { $(key).disabled = !p || busy; $(key).value = p ? p[key] : '' }
+  updateTransform()
   $('layers').replaceChildren()
   project.placements.forEach((p,index) => {
     const button = document.createElement('button')
@@ -46,6 +55,7 @@ async function library() {
   $('library').replaceChildren()
   for (const [name,path] of Object.entries(project.assets)) {
     const result = await api('asset',{path})
+    assetSizes[name] = {width:result.width,height:result.height}
     const image = document.createElement('img')
     image.src = result.url; image.title = name; image.alt = name; image.draggable = true
     image.ondragstart = event => { event.dataTransfer.setData('text/plain',name) }
@@ -53,13 +63,27 @@ async function library() {
   }
 }
 async function prepare() {
-  status('Preparing codec vectors. This decodes the entire clip and may take a while…')
-  info = await api('prepare',{project})
+  revision++; pending = false
+  notice('Opening video…')
+  status('Opening video…')
+  // Validate thumbnails before replacing the current engine or timeline state.
+  await library()
+  const {id} = await api('prepare_start',{project})
+  let nextInfo
+  while (true) {
+    const job = await api('prepare_status',{id})
+    if (job.state === 'error') throw Error(job.error)
+    if (job.state === 'done') { nextInfo = job.result; break }
+    const phase = {opening:'Opening video',decode:'Decoding and analyzing video',vectors:'Extracting codec vectors'}[job.phase] || job.phase
+    const text = `${phase} · ${job.completed}${job.total ? ' / ' + job.total : ''} frames. High-resolution clips can take several minutes.`
+    status(text); notice(text)
+    await new Promise(resolve => setTimeout(resolve,250))
+  }
+  info = nextInfo
   canvas.width = info.width; canvas.height = info.height
-  $('empty').hidden = true
   $('timeline').max = $('frame').max = info.frames - 1
   current = 0; selected = -1
-  await library(); sync(); requestRender()
+  sync(); notice('Rendering first frame…'); requestRender()
   status(`${info.width} × ${info.height} · ${info.frames} frames · ${info.fps.toFixed(3)} fps · ${info.vectors} codec vectors`)
 }
 function requestRender() {
@@ -77,8 +101,8 @@ async function renderLoop() {
       const image = new Image()
       image.src = result.url
       await image.decode()
-      if (ticket === revision) context.drawImage(image,0,0)
-    } catch (error) { status(error.message); stop() }
+      if (ticket === revision) { context.drawImage(image,0,0); $('empty').hidden = true }
+    } catch (error) { failure(error); stop() }
   }
   rendering = false
 }
@@ -97,7 +121,7 @@ $('play').onclick = async () => {
   while (playing && current < info.frames - 1) {
     const start = performance.now()
     if (!rendering) { current++; sync(); requestRender() }
-    await new Promise(resolve => setTimeout(resolve, Math.max(15, 1000 / info.fps - (performance.now() - start))))
+    await new Promise(resolve => setTimeout(resolve, Math.max(15, 1000 * (info.timestamps && current > 0 ? info.timestamps[current] - info.timestamps[current-1] : 1 / info.fps) - (performance.now() - start))))
   }
   stop()
 }
@@ -117,22 +141,23 @@ $('assets').onclick = () => action(async () => {
   }
   await library()
 })
-$('open').onclick = () => action(async () => {
-  const [path] = await choose('open'); if (!path) return
-  const previous = project
-  project = await api('load',{path})
-  try { await prepare(); dirty = false } catch (error) { project = previous; throw error }
-})
-$('save').onclick = () => action(async () => {
-  if (!project.video) throw Error('Import a video first')
-  const [path] = await choose('save'); if (!path) return
-  await api('save',{path,project}); dirty = false; status(`Saved ${path}`)
-})
 $('export').onclick = () => action(async () => {
   if (!info) throw Error('Import a video first')
   const [path] = await choose('export'); if (!path) return
-  status('Exporting through Python. Please wait…')
-  await api('export',{path,project}); status(`Exported ${path}`)
+  const progress = $('export-progress')
+  progress.hidden = false; progress.value = 0
+  try {
+    const {id} = await api('export_start',{path,project})
+    while (true) {
+      const job = await api('export_status',{id})
+      if (job.state === 'error') throw Error(job.error)
+      if (job.state === 'done') { progress.value = 100; status(`Exported ${path}`); break }
+      const percent = job.total ? Math.floor(100 * job.completed / job.total) : 0
+      progress.value = percent
+      status(percent === 100 ? 'Finalizing export…' : `Exporting: ${percent}% (${job.completed} / ${job.total || '…'} frames)`)
+      await new Promise(resolve => setTimeout(resolve,250))
+    }
+  } finally { progress.hidden = true }
 })
 $('remove').onclick = () => {
   if (busy || selected < 0) return
@@ -162,29 +187,40 @@ canvas.ondrop = event => {
   stop(); project.placements.push({asset,start:current,duration:120,x,y,scale:1,rotation:0,strength:1})
   selected = project.placements.length - 1; dirty = true; sync(); requestRender()
 }
-canvas.onpointerdown = event => {
-  if (busy || selected < 0) return
-  const p = project.placements[selected]
-  if (current !== p.start) { seek(p.start); status('Returned to placement start. Drag again to transform.'); return }
-  stop(); const xy = point(event)
-  drag = {xy,x:p.x,y:p.y,rotation:p.rotation,rotate:event.shiftKey}
-  canvas.setPointerCapture(event.pointerId)
+function updateTransform() {
+  const p = project.placements[selected], size = p && assetSizes[p.asset]
+  transform.hidden = !info || !p || !size || current !== p.start || busy
+  if (transform.hidden) return
+  const rect = canvas.getBoundingClientRect(), stage = $('stage').getBoundingClientRect()
+  const factor = Math.min(rect.width / canvas.width, rect.height / canvas.height)
+  const left = rect.left - stage.left + (rect.width - canvas.width * factor) / 2
+  const top = rect.top - stage.top + (rect.height - canvas.height * factor) / 2
+  const width = size.width * p.scale * factor, height = size.height * p.scale * factor
+  Object.assign(transform.style,{width:`${width}px`,height:`${height}px`,
+    left:`${left + p.x * factor - width / 2}px`,top:`${top + p.y * factor - height / 2}px`,
+    transform:`rotate(${p.rotation}deg)`})
 }
-canvas.onpointermove = event => {
-  if (!drag || busy) return
-  const p = project.placements[selected], xy = point(event)
-  if (drag.rotate) p.rotation = drag.rotation + (xy.x - drag.xy.x) * .5
-  else { p.x = drag.x + xy.x - drag.xy.x; p.y = drag.y + xy.y - drag.xy.y }
-  dirty = true; sync(); requestRender()
-}
-canvas.onpointerup = canvas.onpointercancel = () => { drag = null }
-canvas.onwheel = event => {
+window.addEventListener('resize', updateTransform)
+transform.onpointerdown = event => {
   if (busy || selected < 0) return
   event.preventDefault(); stop()
-  const p = project.placements[selected]; current = p.start
-  p.scale = Math.max(.001,Math.min(100,p.scale * Math.exp(-event.deltaY * .001)))
+  const p = project.placements[selected], xy = point(event)
+  const dx = xy.x - p.x, dy = xy.y - p.y
+  drag = {xy,x:p.x,y:p.y,scale:p.scale,rotation:p.rotation,
+    distance:Math.hypot(dx,dy), angle:Math.atan2(dy,dx), mode:event.target.dataset.mode || 'move'}
+  transform.setPointerCapture(event.pointerId)
+}
+transform.onpointermove = event => {
+  if (!drag || busy) return
+  const p = project.placements[selected], xy = point(event)
+  if (drag.mode === 'rotate') {
+    p.rotation = drag.rotation + (Math.atan2(xy.y - drag.y,xy.x - drag.x) - drag.angle) * 180 / Math.PI
+  } else if (drag.mode === 'scale') {
+    p.scale = Math.max(.001,Math.min(100,drag.scale * Math.hypot(xy.x - drag.x,xy.y - drag.y) / Math.max(drag.distance,1)))
+  } else { p.x = drag.x + xy.x - drag.xy.x; p.y = drag.y + xy.y - drag.xy.y }
   dirty = true; sync(); requestRender()
 }
+transform.onpointerup = transform.onpointercancel = () => { drag = null }
 window.addEventListener('keydown', event => {
   if (['INPUT','TEXTAREA'].includes(event.target.tagName)) return
   if (event.key === 'ArrowRight') { event.preventDefault(); seek(current + 1) }
@@ -192,3 +228,5 @@ window.addEventListener('keydown', event => {
 })
 window.addEventListener('beforeunload', event => { if (dirty) { event.preventDefault(); event.returnValue = '' } })
 sync()
+
+console.info('Workbench ready')

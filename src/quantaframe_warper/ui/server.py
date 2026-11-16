@@ -3,9 +3,12 @@
 import base64
 import hmac
 import json
+import logging
 import mimetypes
+import os
 import secrets
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
@@ -16,47 +19,139 @@ from PIL import Image
 from .. import Engine, Project
 
 STATIC = Path(__file__).parent
+LOG = logging.getLogger(__name__)
 
 
 class Workbench:
     def __init__(self):
         self.engine = None
         self.lock = threading.Lock()
+        self.job_lock = threading.Lock()
+        self.job = None
+        self.worker = None
+        self.closed = threading.Event()
+
+    def start_prepare(self, data):
+        # Validation is immediate. Expensive decoding runs outside the HTTP request.
+        project = Project.from_dict(data["project"])
+        with self.job_lock:
+            if self.job and self.job["state"] == "running":
+                raise ValueError("A video import is already running")
+            job_id = secrets.token_hex(8)
+            self.job = dict(
+                id=job_id, state="running", phase="opening", completed=0, total=0
+            )
+        LOG.info("Import %s started: %s", job_id, project.video)
+        last_progress = {"phase": None, "time": 0}
+
+        def progress(phase, index):
+            if self.closed.is_set():
+                raise RuntimeError("Workbench closed")
+            with self.job_lock:
+                if phase == "source_frames":
+                    self.job["total"] = index
+                else:
+                    self.job.update(phase=phase, completed=index)
+                    if phase == "vectors":
+                        self.job["total"] = max(self.job["total"], index)
+                total = self.job["total"]
+            now = time.monotonic()
+            if phase != last_progress["phase"] or now - last_progress["time"] >= 2:
+                LOG.info(
+                    "Import %s: %s %d / %s", job_id, phase, index, total or "unknown"
+                )
+                last_progress.update(phase=phase, time=now)
+
+        def run():
+            try:
+                with self.lock:
+                    self.ensure_engine(project, progress)
+                    result = self.engine.info
+                with self.job_lock:
+                    self.job.update(state="done", result=result)
+                LOG.info(
+                    "Import %s ready: %d frames, %d x %d",
+                    job_id,
+                    result["frames"],
+                    result["width"],
+                    result["height"],
+                )
+            except Exception as error:
+                LOG.exception("Import %s failed", job_id)
+                with self.job_lock:
+                    self.job.update(state="error", error=str(error))
+
+        self.worker = threading.Thread(target=run, daemon=True)
+        self.worker.start()
+        return {"id": job_id}
+
+    def start_export(self, data):
+        project = Project.from_dict(data["project"])
+        path = data["path"]
+        with self.job_lock:
+            if self.job and self.job["state"] == "running":
+                raise ValueError("Another task is already running")
+            job_id = secrets.token_hex(8)
+            self.job = dict(id=job_id, state="running", phase="export", completed=0, total=0)
+
+        def run():
+            try:
+                with self.lock:
+                    self.ensure_engine(project)
+                    with self.job_lock:
+                        self.job["total"] = self.engine.count
+
+                    def progress(phase, index):
+                        with self.job_lock:
+                            self.job.update(phase=phase, completed=index)
+
+                    self.engine.export(project, path, progress=progress)
+                with self.job_lock:
+                    self.job.update(state="done", result={"saved": path})
+                LOG.info("Export complete: %s", path)
+            except Exception as error:
+                LOG.exception("Export %s failed", job_id)
+                with self.job_lock:
+                    self.job.update(state="error", error=str(error))
+
+        self.worker = threading.Thread(target=run, daemon=True)
+        self.worker.start()
+        return {"id": job_id}
+
+    def ensure_engine(self, project, progress=None):
+        if self.engine is None or self.engine.video != Path(project.video).resolve():
+            LOG.info("Opening video: %s", project.video)
+            engine = Engine(project.video, progress=progress)
+            if self.engine:
+                self.engine.close()
+            self.engine = engine
 
     def call(self, method, data):
+        if method == "prepare_start":
+            return self.start_prepare(data)
+        if method == "export_start":
+            return self.start_export(data)
+        if method in ("prepare_status", "export_status"):
+            with self.job_lock:
+                if self.job is None or self.job["id"] != data["id"]:
+                    raise ValueError("Unknown import job")
+                return dict(self.job)
         with self.lock:
-            if method == "load":
-                return Project.load(data["path"]).to_dict()
-            if method == "save":
-                project = Project.from_dict(data["project"])
-                path = Path(data["path"]).resolve()
-                if path in [
-                    Path(project.video).resolve(),
-                    *(Path(p).resolve() for p in project.assets.values()),
-                ]:
-                    raise ValueError("Project file cannot overwrite an input")
-                project.save(path)
-                return {"saved": str(path)}
             if method == "asset":
                 with Image.open(data["path"]) as image:
                     if image.format != "PNG":
                         raise ValueError("Asset must be PNG")
+                    width, height = image.size
                     image.thumbnail((128, 128))
                     buffer = BytesIO()
                     image.save(buffer, format="PNG")
                 return {
+                    "width": width, "height": height,
                     "url": "data:image/png;base64,"
                     + base64.b64encode(buffer.getvalue()).decode()
                 }
             project = Project.from_dict(data["project"])
-            if (
-                self.engine is None
-                or self.engine.video != Path(project.video).resolve()
-            ):
-                engine = Engine(project.video)
-                if self.engine:
-                    self.engine.close()
-                self.engine = engine
+            self.ensure_engine(project)
             if method == "prepare":
                 return self.engine.info
             if method == "render":
@@ -67,14 +162,15 @@ class Workbench:
                     "url": "data:image/png;base64,"
                     + base64.b64encode(buffer.getvalue()).decode()
                 }
-            if method == "export":
-                self.engine.export(project, data["path"])
-                return {"saved": data["path"]}
             raise ValueError("Unknown method")
 
     def close(self):
-        if self.engine:
-            self.engine.close()
+        self.closed.set()
+        if self.worker:
+            self.worker.join()
+        with self.lock:
+            if self.engine:
+                self.engine.close()
 
 
 def create_server():
@@ -83,9 +179,12 @@ def create_server():
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
+            # The default request line includes the authentication query string.
+            # Log only method, path and response status from reply().
             pass
 
         def reply(self, status, content, kind="application/json"):
+            LOG.debug("%s %s -> %d", self.command, urlsplit(self.path).path, status)
             self.send_response(status)
             self.send_header("Content-Type", kind)
             self.send_header("Content-Length", str(len(content)))
@@ -139,6 +238,7 @@ def create_server():
                 )
                 self.reply(200, json.dumps(result).encode())
             except Exception as error:
+                LOG.exception("%s %s failed", self.command, urlsplit(self.path).path)
                 self.reply(400, json.dumps({"error": str(error)}).encode())
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -146,13 +246,21 @@ def create_server():
 
 
 def main():
+    default_level = "INFO" if os.environ.get("QUANTAFRAME_DEV") == "1" else "WARNING"
+    logging.basicConfig(
+        level=os.environ.get("QUANTAFRAME_LOG_LEVEL", default_level).upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     server, workbench, url = create_server()
+    # Stdout's first line is a private readiness message consumed by Electron.
     print(json.dumps({"url": url}), flush=True)
+    LOG.info("Backend listening on %s", urlsplit(url).netloc)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        LOG.info("Backend shutting down")
         server.server_close()
         workbench.close()
 

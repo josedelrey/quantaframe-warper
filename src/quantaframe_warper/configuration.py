@@ -1,30 +1,9 @@
-"""Versioned project files shared by the API, CLI and desktop."""
+"""Validated in-memory editing settings."""
 
 from __future__ import annotations
 
 import math
-import tempfile
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
-
-import yaml
-
-
-class ProjectLoader(yaml.SafeLoader):
-    pass
-
-
-def _mapping(loader, node):
-    result = {}
-    for key, value in node.value:
-        key = loader.construct_object(key)
-        if not isinstance(key, str) or key in result:
-            raise ValueError(f"Invalid or duplicate project key: {key}")
-        result[key] = loader.construct_object(value)
-    return result
-
-
-ProjectLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _mapping)
 
 
 def _keys(data, allowed):
@@ -100,7 +79,7 @@ class Project:
                 raise ValueError("Each placement must reference an imported asset")
 
     @classmethod
-    def from_dict(cls, data, base: Path | None = None):
+    def from_dict(cls, data):
         _keys(data, ("version", "video", "assets", "placements"))
         data = dict(data)
         items = data.get("placements", [])
@@ -116,17 +95,6 @@ class Project:
         if "video" not in data:
             raise ValueError("Project requires video")
         project = cls(**data)
-        if base is not None:
-
-            def resolve(p):
-                return str((base / p).resolve())
-
-            project = cls(
-                resolve(project.video),
-                {k: resolve(v) for k, v in project.assets.items()},
-                project.placements,
-                project.version,
-            )
         return project
 
     def to_dict(self):
@@ -134,32 +102,3 @@ class Project:
         data["placements"] = list(data["placements"])
         return data
 
-    @classmethod
-    def load(cls, path):
-        path = Path(path).resolve()
-        return cls.from_dict(
-            yaml.load(path.read_text(), Loader=ProjectLoader), path.parent
-        )
-
-    def save(self, path):
-        # Absolute paths make Save As unambiguous. Handwritten relative paths load
-        # relative to the YAML file, never the process working directory.
-        data = self.to_dict()
-        data["video"] = str(Path(self.video).resolve())
-        data["assets"] = {k: str(Path(v).resolve()) for k, v in self.assets.items()}
-        path = Path(path).resolve()
-        if path in [Path(data["video"]), *(Path(p) for p in data["assets"].values())]:
-            raise ValueError("Project file cannot overwrite an input")
-        with tempfile.NamedTemporaryFile(
-            mode="w", dir=path.parent, suffix=".yaml", delete=False
-        ) as file:
-            temporary = Path(file.name)
-            try:
-                file.write(yaml.safe_dump(data, sort_keys=False))
-            except BaseException:
-                temporary.unlink(missing_ok=True)
-                raise
-        try:
-            temporary.replace(path)
-        finally:
-            temporary.unlink(missing_ok=True)

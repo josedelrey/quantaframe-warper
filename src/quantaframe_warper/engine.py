@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 from fractions import Fraction
+from itertools import chain
 from pathlib import Path
 
 import av
@@ -44,7 +45,21 @@ class Engine:
             self.fps = Fraction(stream.average_rate or 30)
             if self.fps <= 0:
                 raise ValueError("Invalid source frame rate")
-            self.width, self.height = stream.width, stream.height
+            source_size = (stream.width, stream.height)
+            frames = source.decode(stream)
+            first = next(frames, None)
+            if first is None:
+                raise ValueError("Video has no decoded frames")
+            rotation = first.rotation
+            if rotation % 90:
+                raise ValueError("Only right-angle video rotation is supported")
+            self.width, self.height = source_size
+            if rotation % 180:
+                self.width, self.height = self.height, self.width
+            self.time_base = stream.time_base or Fraction(1, 90000)
+            self.timestamps = []
+            self.frame_durations = []
+            progress("source_frames", stream.frames or 0)
             if self.width % 2 or self.height % 2:
                 raise ValueError("MVP requires even video width and height")
             if stream.sample_aspect_ratio not in (None, Fraction(1)):
@@ -58,24 +73,39 @@ class Engine:
                 "x264-params": "bframes=0:ref=1:scenecut=0:keyint=1000000:weightp=0",
             }
             first_time = None
-            for index, frame in enumerate(source.decode(stream)):
-                if (frame.width, frame.height) != (self.width, self.height):
-                    raise ValueError("Variable frame dimensions are unsupported")
-                if frame.rotation or frame.interlaced_frame:
+            for index, frame in enumerate(chain((first,), frames)):
+                if (
+                    frame.width,
+                    frame.height,
+                ) != source_size or frame.rotation != rotation:
                     raise ValueError(
-                        "Rotate/deinterlace input to progressive upright video first"
+                        "Variable frame dimensions or orientation are unsupported"
                     )
-                if frame.time is not None:
+                if frame.interlaced_frame:
+                    raise ValueError("Deinterlace input to progressive video first")
+                if frame.pts is not None and frame.time_base is not None:
+                    timestamp = frame.pts * frame.time_base
                     if first_time is None:
-                        first_time = frame.time
-                    if abs(frame.time - first_time - float(index / self.fps)) > float(
-                        0.2 / self.fps
-                    ):
-                        raise ValueError(
-                            "Variable frame rate input is unsupported. Convert to CFR first"
-                        )
+                        first_time = timestamp
+                    timestamp -= first_time
+                else:
+                    timestamp = (
+                        self.timestamps[-1] + 1 / self.fps if index else Fraction(0)
+                    )
+                if self.timestamps and timestamp <= self.timestamps[-1]:
+                    raise ValueError(
+                        "Video timestamps must increase in presentation order"
+                    )
+                self.timestamps.append(timestamp)
+                self.frame_durations.append(
+                    frame.duration * frame.time_base
+                    if frame.duration and frame.time_base
+                    else 1 / self.fps
+                )
                 rgb = frame.to_ndarray(format="rgb24")
-                Image.fromarray(rgb).save(self.root / f"{index}.png")
+                if rotation:
+                    rgb = np.ascontiguousarray(np.rot90(rgb, rotation // 90))
+                Image.fromarray(rgb).save(self.root / f"{index}.png", compress_level=1)
                 analysis = av.VideoFrame.from_ndarray(rgb, format="rgb24")
                 analysis.pts = index
                 analysis.time_base = 1 / self.fps
@@ -87,6 +117,10 @@ class Engine:
                 output.mux(packet)
         if not self.count:
             raise ValueError("Video has no decoded frames")
+        for index in range(self.count - 1):
+            self.frame_durations[index] = (
+                self.timestamps[index + 1] - self.timestamps[index]
+            )
         self.vector_count = 0
         decoded = 0
         with av.open(str(proxy)) as source:
@@ -117,6 +151,7 @@ class Engine:
             height=self.height,
             frames=self.count,
             fps=float(self.fps),
+            timestamps=[float(t) for t in self.timestamps],
             vectors=self.vector_count,
             analysis="H.264 P-only, one reference, CRF 18",
         )
@@ -182,19 +217,29 @@ class Engine:
                 stream = container.add_stream("libx264", rate=self.fps)
                 stream.width, stream.height = self.width, self.height
                 stream.pix_fmt = "yuv420p"
+                stream.time_base = self.time_base
+                stream.codec_context.time_base = self.time_base
+                duration_by_time = dict(zip(self.timestamps, self.frame_durations))
+
+                def mux(packet):
+                    duration = duration_by_time.get(packet.pts * packet.time_base)
+                    if duration is not None:
+                        packet.duration = round(duration / packet.time_base)
+                    container.mux(packet)
+
                 stream.options = {"crf": "18", "preset": "medium"}
                 for index in range(self.count):
                     frame = av.VideoFrame.from_ndarray(
                         self.render(project, index), format="rgb24"
                     )
-                    frame.pts = index
-                    frame.time_base = 1 / self.fps
+                    frame.pts = round(self.timestamps[index] / self.time_base)
+                    frame.time_base = self.time_base
                     for packet in stream.encode(frame):
-                        container.mux(packet)
+                        mux(packet)
                     if progress:
                         progress("export", index + 1)
                 for packet in stream.encode():
-                    container.mux(packet)
+                    mux(packet)
             temporary.replace(output)
         finally:
             temporary.unlink(missing_ok=True)

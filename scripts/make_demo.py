@@ -7,8 +7,6 @@ import av
 import numpy as np
 from PIL import Image, ImageDraw
 
-from quantaframe_warper import Placement, Project
-
 
 def main():
     root = Path("outputs/demo").resolve()
@@ -45,12 +43,7 @@ def main():
     draw.ellipse((63, 63, 97, 97), fill=(10, 15, 20, 255))
     draw.ellipse((66, 62, 78, 74), fill=(255, 255, 255, 255))
     image.save(asset)
-    Project(
-        str(video),
-        {"eye": str(asset)},
-        (Placement("eye", start=0, duration=72, x=240, y=160),),
-    ).save(root / "project.yaml")
-    print(root / "project.yaml")
+    print(video)
 
 
 if __name__ == "__main__":
