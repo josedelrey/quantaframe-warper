@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Quantaframe Warper</title></head>
+<body>
+<header><strong>QUANTAFRAME / WARPER</strong><span>codec motion laboratory</span><button id="video">Import video</button><button id="assets">Import PNGs</button><button id="open">Open project</button><button id="save">Save project</button><button id="export">Export MP4</button></header>
+<main>
+<aside><h3>PNG assets</h3><p>Drag onto the frame to place.</p><div id="library"></div><h3>Layers</h3><div id="layers"></div><button id="remove">Remove selected</button></aside>
+<section id="viewer"><div id="stage"><canvas id="preview" width="960" height="540"></canvas><div id="empty">Import a video to begin</div></div><div id="transport"><button id="back">◀</button><button id="play">Play</button><button id="next">▶</button><input id="timeline" type="range" min="0" max="0" value="0" step="1"><input id="frame" type="number" min="0" value="0"><span id="time">/ 0</span></div><p id="status" role="status">Ready. Preview and export use the Python engine.</p></section>
+<aside><h3>Selected placement</h3><p>Transform at the placement's start frame. Drag to move. Shift-drag to rotate. Wheel to scale.</p><label>Start frame<input id="start" type="number" min="0" step="1"></label><label>Duration (frames)<input id="duration" type="number" min="1" step="1"></label><label>Center X<input id="x" type="number" step="1"></label><label>Center Y<input id="y" type="number" step="1"></label><label>Scale<input id="scale" type="number" min="0.001" max="100" step="0.05"></label><label>Rotation (degrees)<input id="rotation" type="number" step="1"></label><label>Motion strength<input id="strength" type="number" min="-20" max="20" step="0.1"></label><p id="analysis">Analysis: H.264, P-only, one reference. Intra blocks hold. Export is silent.</p></aside>
+</main>
+<script src="/app.js" defer></script>
+</body></html>

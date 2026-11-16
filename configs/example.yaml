@@ -1,0 +1,14 @@
+version: 1
+# Paths in handwritten YAML resolve relative to this file.
+video: ../local_inputs/video.mp4
+assets:
+  eye: ../local_inputs/eye.png
+placements:
+  - asset: eye
+    start: 24
+    duration: 120
+    x: 320
+    y: 240
+    scale: 0.75
+    rotation: 0
+    strength: 1
