@@ -17,6 +17,7 @@ import numpy as np
 from PIL import Image
 
 from .configuration import Project
+from .flow import FlowGuide
 from .motion import composite, place, vector_field, warp
 
 _CACHE_WORKERS = 3
@@ -52,11 +53,22 @@ class Engine:
     Sessions are synchronous and must not be accessed concurrently.
     """
 
-    def __init__(self, video, *, progress=None, playback=False, frame_limit=None):
+    def __init__(
+        self,
+        video,
+        *,
+        progress=None,
+        playback=False,
+        frame_limit=None,
+        seconds=None,
+        optical_flow=True,
+    ):
         if frame_limit is not None and (
             type(frame_limit) is not int or frame_limit < 1
         ):
             raise ValueError("Frame limit must be a positive integer")
+        if seconds is not None and (not 0 < seconds < float("inf")):
+            raise ValueError("Seconds must be positive and finite")
         self.video = Path(video).resolve()
         self._temp = tempfile.TemporaryDirectory(prefix="quantaframe-")
         self.root = Path(self._temp.name)
@@ -65,13 +77,16 @@ class Engine:
         self._playback_size = None
         try:
             self._prepare(
-                progress or (lambda phase, index: None), playback, frame_limit
+                progress or (lambda phase, index: None), playback, frame_limit, seconds
+            )
+            self._flow = (
+                FlowGuide(self.root, self.width, self.height) if optical_flow else None
             )
         except BaseException:
             self.close()
             raise
 
-    def _prepare(self, progress, playback, frame_limit):
+    def _prepare(self, progress, playback, frame_limit, seconds):
         proxy = self.root / "analysis.mp4"
         self.count = 0
         with (
@@ -147,6 +162,8 @@ class Engine:
                     raise ValueError(
                         "Video timestamps must increase in presentation order"
                     )
+                if seconds is not None and timestamp >= seconds:
+                    break
                 self.timestamps.append(timestamp)
                 self.frame_durations.append(
                     frame.duration * frame.time_base
@@ -247,6 +264,8 @@ class Engine:
         return buffer.getvalue()
 
     def _motion_field(self, index, size):
+        if self._flow is not None:
+            return self._flow.motion_field(index, size)
         width, height = size
         scale = (width / self.width, height / self.height)
         vectors = np.load(self.root / f"{index}.npy", allow_pickle=False)

@@ -1,12 +1,13 @@
 # quantaframe-warper
 
 Experimental video editor that deforms independent PNG layers with decoded codec
-motion vectors. Different blocks of one PNG can move in opposite directions,
+motion vectors assisted by dense optical flow. Different blocks of one PNG can
+move in opposite directions,
 shear, duplicate or disappear. The RGBA mask follows the same deformation as the
 color. The background uses the original decoded video frames.
 
 This MVP provides a Python API, a video inspection CLI and an Electron workbench sharing
-one Python engine. No optical flow or object tracker is used.
+one Python engine. Dense DIS optical flow fills missing codec motion by default.
 
 ## Run the desktop editor
 
@@ -47,7 +48,7 @@ for the implications of `--no-sandbox`.
 Frame indexes start at zero. Left and right arrows step one frame. Duration includes
 the placement frame and the layer disappears at `start + duration`. Layers composite
 in list order, with later placements on top. Positive rotation is clockwise.
-Strength 1 applies the full codec displacement, 0 freezes the layer, and negative
+Strength 1 applies the full hybrid displacement, 0 freezes the layer, and negative
 values reverse displacement. Higher strengths amplify block artifacts.
 
 The desktop starts the repository's `.venv` Python directly. Set
@@ -143,10 +144,16 @@ the public side-data interface does not expose.
 
 Each codec block supplies a destination-to-previous-frame pull map. The engine
 samples all four premultiplied RGBA channels through it using bilinear interpolation
-and transparent borders. It does not smooth the block field. Intra-coded and
-missing blocks use zero displacement, which holds the previous layer at those
-locations. This policy allows the layer to persist across I-frames, but can leave
-parts behind near disocclusions or scene changes. Overlapping pull regions can
+and transparent borders. Missing codec blocks use dense DIS optical flow computed
+from the original upright frames at up to 960 pixels on the longest edge.
+A forward/backward consistency check accepts estimates with a round-trip error
+of at most one analysis pixel. Explicit zero codec vectors retain zero movement.
+Missing blocks with rejected flow still hold, so residues can remain near
+disocclusions or scene changes. The previous warped layer is propagated each frame.
+Flow is computed on demand and cached in the temporary session for seeking,
+playback and export. The first pass costs more processing time and the cache
+uses additional disk space. Use `Engine(video, optical_flow=False)` for the
+codec-only baseline. Overlapping pull regions can
 copy pixels and divergent regions can tear holes. Repeated interpolation gradually
 softens detail. These artifacts are part of the experiment.
 
